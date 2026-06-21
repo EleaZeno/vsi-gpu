@@ -162,15 +162,19 @@ def _decode(model, prompts, temp=0.0):
         for i, c in enumerate(cur):
             cc = c[-SEQ:]; batch[i, :len(cc)] = cc
         lg = model(torch.tensor(batch, device=DEV))
+        # gather the logit at each row's current last position, all on GPU
+        pos = torch.tensor([len(c) - 1 for c in cur], device=DEV)
+        step_logits = lg[torch.arange(len(cur), device=DEV), pos]  # [N, V]
+        if temp <= 0.0:
+            nxs = torch.argmax(step_logits, dim=-1)
+        else:
+            probs = F.softmax(step_logits / temp, dim=-1)
+            nxs = torch.multinomial(probs, 1).squeeze(-1)
+        nxs = nxs.cpu().tolist()
         for i, c in enumerate(cur):
             if done[i]:
                 continue
-            logit = lg[i, len(c) - 1]
-            if temp <= 0.0:
-                nx = int(torch.argmax(logit))
-            else:
-                p = F.softmax(logit / temp, dim=-1).float().cpu().numpy()
-                nx = int(np.random.choice(len(p), p=p / p.sum()))
+            nx = nxs[i]
             if nx == PAD:
                 done[i] = True; continue
             outs[i].append(itos.get(nx, "?")); c.append(nx)
@@ -190,9 +194,13 @@ def self_label_verified(model, prompts, metas, mode, p_leak, rng, k=5, temp=0.7,
     Returns (pairs, kept_frac, purity) where purity = frac of accepted labels that are truly correct.
     Verifier never reads the stored true label; uses verify_label(a,b,.) = independent inverse check."""
     votes = [Counter() for _ in prompts]
-    for _ in range(k):
-        finals = [final_of(o) for o in _decode(model, prompts, temp=temp)]
-        for i, f in enumerate(finals):
+    # BATCHED: replicate prompts k times into one big decode call (k-fold speedup on GPU)
+    big = prompts * k
+    finals_big = [final_of(o) for o in _decode(model, big, temp=temp)]
+    n = len(prompts)
+    for j in range(k):
+        for i in range(n):
+            f = finals_big[j * n + i]
             if f != "<e>":
                 votes[i][f] += 1
     pairs = []; n_acc = 0; n_correct = 0
